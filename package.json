@@ -1,0 +1,25 @@
+{
+  "private": true,
+  "scripts": {
+    "start": "ts-node ./index.ts"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "escape-html": "^1.0.3",
+    "html-minifier": "^4.0.0",
+    "mime": "^2.5.0",
+    "postcss": "^8.2.6",
+    "postcss-url": "^10.1.1",
+    "puppeteer": "^7.1.0",
+    "ts-node": "^9.1.1",
+    "typescript": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/escape-html": "^1.0.0",
+    "@types/html-minifier": "^4.0.0",
+    "@types/mime": "^2.0.3",
+    "@types/postcss-url": "^8.0.1",
+    "prettier": "^2.2.1"
+  }
+}
