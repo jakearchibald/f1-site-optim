@@ -7,8 +7,18 @@ import { promises as fs } from 'fs';
 import * as pathUtils from 'path';
 import { getExtension, define as defineMime } from 'mime';
 import escapeHTML from 'escape-html';
+import fetch from 'node-fetch';
+import zopfli from 'node-zopfli';
+import { promisify } from 'util';
+import { brotliCompress } from 'zlib';
+import prettyBytes from 'pretty-bytes';
+
+const zopfliGzip: (arg: Buffer) => Promise<Buffer> = promisify(zopfli.gzip);
+const brotli = promisify(brotliCompress);
 
 defineMime({ 'application/font-woff2': ['woff2'] }, true);
+
+const DEBUG = false;
 
 const mobileViewport = {
   width: 1080 / 3,
@@ -47,7 +57,7 @@ async function snapshotDomAfterLoad(
   const page = await browser.newPage();
   await page.setViewport(mobileViewport);
   await page.goto(url, { waitUntil: 'networkidle2' });
-  await page.evaluate(() => {
+  await page.evaluate(async () => {
     for (const el of document.querySelectorAll(
       'iframe, script, link[rel=preload], img[src=""]',
     )) {
@@ -66,11 +76,10 @@ async function snapshotDomAfterLoad(
         ] as const,
     );
     for (const [el, rect, height] of imgData) {
-      const rect = el.getBoundingClientRect();
-
       if (!el.hasAttribute('width') && height === 'auto') {
         el.width = el.naturalWidth;
         el.height = el.naturalHeight;
+        el.decoding = 'async';
         el.style.height = 'auto';
       }
 
@@ -81,10 +90,15 @@ async function snapshotDomAfterLoad(
         el.loading = 'lazy';
       }
     }
+
+    // Remove any service workers
+    for (const reg of await navigator.serviceWorker.getRegistrations()) {
+      await reg.unregister();
+    }
   });
 
   const content = await page.content();
-  page.close();
+  if (!DEBUG) page.close();
   return content;
 }
 
@@ -113,7 +127,7 @@ async function removeHiddenElements(
     interceptedRequest.continue();
   });
 
-  await page.goto(url, { waitUntil: 'load' });
+  await page.goto(url, { waitUntil: 'networkidle0' });
 
   page.evaluate(() => {
     const elementState = [...document.querySelectorAll('body *')].map((el) => {
@@ -148,8 +162,111 @@ async function removeHiddenElements(
   });
 
   const content = await page.content();
-  page.close();
+  if (!DEBUG) page.close();
   return content;
+}
+
+interface SizeReportResource {
+  type: 'document' | 'stylesheet' | 'script';
+  originalSize: number;
+  zopfliSize: number;
+  brotliSize: number;
+}
+
+interface SizeReport {
+  resources: SizeReportResource[];
+  combinedCSS: SizeReportResource;
+  combinedJS: SizeReportResource;
+}
+
+async function sizeReport(browser: Browser, url: string): Promise<SizeReport> {
+  const page = await browser.newPage();
+  await page.setViewport(mobileViewport);
+  const resources: PageResources[] = [];
+
+  page.on('response', async (response: HTTPResponse) => {
+    if (response.headers().location) return;
+    const request = response.request();
+    const originalRequest = request.redirectChain()[0] || request;
+    const requestUrl = originalRequest.url();
+    if (!new URL(requestUrl).protocol.startsWith('http')) return;
+    resources.push({
+      request: originalRequest,
+      response,
+    });
+  });
+
+  await page.goto(url, { waitUntil: 'load' });
+
+  const types = ['document', 'stylesheet', 'script'] as const;
+  const reportResources: SizeReportResource[] = [];
+  let cssSizeReport: SizeReportResource;
+  let jsSizeReport: SizeReportResource;
+
+  await Promise.all([
+    ...resources.map(async (entry) => {
+      // @ts-ignore
+      if (!types.includes(entry.request.resourceType())) return;
+
+      const originalSize =
+        Number(entry.response.headers()['content-length']) || Infinity;
+
+      if (originalSize === Infinity) {
+        console.log('No content length', entry.request.url());
+      }
+
+      const buffer = await entry.response.buffer();
+
+      const [zopfliBuffer, brotliBuffer] = await Promise.all([
+        zopfliGzip(buffer),
+        brotli(buffer),
+      ]);
+
+      reportResources.push({
+        type: entry.request.resourceType() as typeof types[number],
+        brotliSize: brotliBuffer.byteLength,
+        zopfliSize: zopfliBuffer.byteLength,
+        originalSize,
+      });
+    }),
+    ...(['script', 'stylesheet'] as const).map(async (type) => {
+      const typedResources = resources.filter(
+        (entry) => entry.request.resourceType() === type,
+      );
+      const buffers = await Promise.all(
+        typedResources.map((r) => r.response.buffer()),
+      );
+      const sizes = typedResources.map(
+        (entry) =>
+          Number(entry.response.headers()['content-length']) || Infinity,
+      );
+      const originalSize = sizes.reduce((a, b) => a + b);
+      const combined = Buffer.concat(buffers);
+      const [zopfliBuffer, brotliBuffer] = await Promise.all([
+        zopfliGzip(combined),
+        brotli(combined),
+      ]);
+
+      const result: SizeReportResource = {
+        type,
+        brotliSize: brotliBuffer.byteLength,
+        zopfliSize: zopfliBuffer.byteLength,
+        originalSize,
+      };
+
+      if (type === 'stylesheet') {
+        cssSizeReport = result;
+      } else {
+        jsSizeReport = result;
+      }
+    }),
+  ]);
+
+  return {
+    combinedCSS: cssSizeReport!,
+    combinedJS: jsSizeReport!,
+    resources: reportResources,
+  };
 }
 
 async function optimiseAndOutput(
@@ -164,7 +281,8 @@ async function optimiseAndOutput(
 
   // Intercept page request
   await page.setRequestInterception(true);
-  page.on('request', (interceptedRequest: HTTPRequest) => {
+
+  page.on('request', async (interceptedRequest: HTTPRequest) => {
     if (interceptedRequest.url() === url) {
       interceptedRequest.respond({
         status: 200,
@@ -174,11 +292,30 @@ async function optimiseAndOutput(
       });
       return;
     }
+    const parsedUrl = new URL(interceptedRequest.url());
+
+    // Some woff2 fonts are served without a content-type, and devtools protocol messes that up.
+    // https://bugs.chromium.org/p/chromium/issues/detail?id=1179646
+
+    for (const fontType of ['woff', 'woff2']) {
+      if (parsedUrl.pathname.endsWith(`.${fontType}`)) {
+        const response = await fetch(parsedUrl);
+        const buffer = await response.buffer();
+        interceptedRequest.respond({
+          body: buffer,
+          headers: Object.fromEntries(response.headers.entries()),
+          contentType: `font/${fontType}`,
+          status: response.status,
+        });
+        return;
+      }
+    }
     interceptedRequest.continue();
   });
 
   // Capture requests to external CSS
   const resources: PageResources[] = [];
+
   page.on('response', async (response: HTTPResponse) => {
     if (response.headers().location) return;
     const request = response.request();
@@ -192,7 +329,7 @@ async function optimiseAndOutput(
     });
   });
 
-  await page.goto(url, { waitUntil: 'load' });
+  await page.goto(url, { waitUntil: 'networkidle0' });
 
   // Rewrite URLs in external CSS
   const externalCSSSources = await Promise.all(
@@ -356,22 +493,32 @@ async function optimiseAndOutput(
 
         for (const img of document.querySelectorAll('img')) {
           img.src = img.src;
-          if (img.srcset) {
-            img.srcset = stringifySrcset(
-              parseSrcset(img.srcset).map((result) => ({
-                ...result,
-                url: new window.URL(result.url!, location.href).href,
-              })),
-            );
-          }
+        }
+        for (const el of document.querySelectorAll('[srcset]') as NodeListOf<
+          HTMLImageElement | HTMLSourceElement
+        >) {
+          el.srcset = stringifySrcset(
+            parseSrcset(el.srcset).map((result) => ({
+              ...result,
+              url: new window.URL(result.url!, location.href).href,
+            })),
+          );
         }
       }
 
-      // Remove redundant stuff
-      for (const el of document.querySelectorAll(
-        'iframe, script, link[rel=preload]',
-      )) {
-        el.remove();
+      // Remove redundant attributes
+      for (const el of document.querySelectorAll('*')) {
+        for (const attribute of [...el.attributes]) {
+          const name = attribute.name.toLowerCase();
+          if (
+            name.startsWith('data-') ||
+            name === 'contenteditable' ||
+            (name === 'placeholder' && el.tagName !== 'INPUT') ||
+            name === 'spellcheck'
+          ) {
+            el.removeAttributeNode(attribute);
+          }
+        }
       }
 
       // Absolute URLs in style attrs
@@ -398,6 +545,7 @@ async function optimiseAndOutput(
               '',
             );
             try {
+              if (selector === '.rdt') console.log('seen');
               if (!document.querySelector(selector)) {
                 indexesToDelete.push(i);
               }
@@ -409,6 +557,9 @@ async function optimiseAndOutput(
             if (rule.cssRules.length === 0) {
               indexesToDelete.push(i);
             }
+          } else if (rule instanceof CSSImportRule) {
+            // These seem to just be font api counters
+            indexesToDelete.push(i);
           }
         }
 
@@ -416,12 +567,14 @@ async function optimiseAndOutput(
           group.deleteRule(index);
         }
       };
-      for (const styleSheet of document.styleSheets) {
+      for (const styleSheet of [...document.styleSheets]) {
         tackleCSSGroup(styleSheet);
         const node = styleSheet.ownerNode!;
         node.textContent = [...styleSheet.cssRules]
           .map((r) => r.cssText)
           .join('');
+
+        if (node.childNodes.length === 0) node.remove();
       }
     },
     processedInlineCSS,
@@ -468,35 +621,94 @@ async function optimiseAndOutput(
     optimizedSource = optimizedSource.replaceAll(escapeHTML(from), to);
   }
 
-  optimizedSource = minify(optimizedSource, {
-    collapseBooleanAttributes: true,
-    collapseWhitespace: true,
-    decodeEntities: true,
-    minifyCSS: true,
-    removeAttributeQuotes: true,
-    removeComments: true,
-    useShortDoctype: true,
-  });
+  if (!DEBUG) {
+    optimizedSource = minify(optimizedSource, {
+      collapseBooleanAttributes: true,
+      collapseWhitespace: true,
+      decodeEntities: true,
+      minifyCSS: true,
+      removeAttributeQuotes: true,
+      removeComments: true,
+      useShortDoctype: true,
+    });
+  }
 
   await fs.writeFile(pathUtils.join('out', 'index.html'), optimizedSource);
 
-  page.close();
+  if (!DEBUG) page.close();
+
+  return sizeReport;
 }
 
 (async () => {
   const browser = await launch({
-    //headless: false,
+    headless: !DEBUG,
   });
 
   //const url = 'https://www.astonmartinf1.com/en-GB/';
   //const url = 'https://www.mclaren.com/racing/';
   //const url = 'https://www.ferrari.com/en-EN/formula1';
   //const url = 'https://www.mercedesamgf1.com/en/';
-  //const url = 'https://www.scuderiaalphatauri.com/en/';
-  const url = 'https://www.redbull.com/int-en/redbullracing';
+  const url = 'https://www.scuderiaalphatauri.com/en/';
+  //const url = 'https://www.redbull.com/int-en/redbullracing';
+  //const url = 'https://www.haasf1team.com/';
+  //const url = 'https://www.sauber-group.com/motorsport/formula-1/';
+  //const url = 'https://www.alpinecars.com/en/formula-1/news/';
+  //const url = 'https://www.williamsf1.com/';
 
-  let source = await snapshotDomAfterLoad(browser, url);
-  source = await removeHiddenElements(browser, source, url);
-  await optimiseAndOutput(browser, source, url);
-  browser.close();
+  const justSizeReport = true;
+
+  if (justSizeReport) {
+    const report = await sizeReport(browser, url);
+    const docs = report.resources.filter(
+      (resource) => resource.type === 'document',
+    );
+    for (const doc of docs) {
+      console.log('== Doc ==');
+      console.log(
+        'Original size',
+        doc.originalSize === Infinity
+          ? Infinity
+          : prettyBytes(doc.originalSize),
+      );
+      console.log('Zopfli size', prettyBytes(doc.zopfliSize));
+      console.log('Brotli size', prettyBytes(doc.brotliSize));
+    }
+
+    for (const type of ['stylesheet', 'script'] as const) {
+      const resources = report.resources.filter(
+        (resource) => resource.type === type,
+      );
+      const originalSize = resources
+        .map((r) => r.originalSize)
+        .reduce((a, b) => (b === Infinity ? a : a + b), 0);
+      const zopfliSize = resources
+        .map((r) => r.zopfliSize)
+        .reduce((a, b) => a + b);
+      const brotliSize = resources
+        .map((r) => r.brotliSize)
+        .reduce((a, b) => a + b);
+      const combo =
+        type === 'stylesheet' ? report.combinedCSS : report.combinedJS;
+
+      console.log(type === 'stylesheet' ? '== Styles ==' : '== Script ==');
+      console.log(resources.length, 'resources');
+      console.log('Separate');
+      console.log(
+        'Original size',
+        originalSize === Infinity ? Infinity : prettyBytes(originalSize),
+      );
+      console.log('Zopfli size', prettyBytes(zopfliSize));
+      console.log('Brotli size', prettyBytes(brotliSize));
+      console.log('Combined');
+      console.log('Zopfli size', prettyBytes(combo.zopfliSize));
+      console.log('Brotli size', prettyBytes(combo.brotliSize));
+    }
+  } else {
+    let source = await snapshotDomAfterLoad(browser, url);
+    source = await removeHiddenElements(browser, source, url);
+    await optimiseAndOutput(browser, source, url);
+  }
+
+  if (!DEBUG) browser.close();
 })();
